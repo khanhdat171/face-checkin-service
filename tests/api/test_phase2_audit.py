@@ -454,12 +454,48 @@ def test_commit_failure_rolls_back_and_closes_session(audit_app, monkeypatch):
     assert not _user_exists(email)
     assert _count_rows(CheckInRecordORM) == 0
     
+
 def export_audit_report(report: dict | list) -> None:
-    rendered = json.dumps(report, ensure_ascii=False, indent=2)
+    # Chuyển report thành dictionary để bổ sung metadata
+    if isinstance(report, dict):
+        report_data = dict(report)
+    else:
+        report_data = {"results": report}
+
+    # Xác định thư mục gốc repository
+    repo_root = Path(__file__).resolve().parents[2]
+
+    # Lấy SHA commit hiện tại
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    git_head = result.stdout.strip()
+
+    # Tính SHA256 của ảnh PNG fixture
+    fixture_sha256 = hashlib.sha256(
+        _valid_png_bytes()
+    ).hexdigest()
+
+    # Bổ sung metadata trực tiếp vào JSON
+    report_data["git_head"] = git_head
+    report_data["fixture_sha256"] = fixture_sha256
+
+    # Chuyển report thành JSON
+    rendered = json.dumps(
+        report_data,
+        ensure_ascii=False,
+        indent=2,
+    )
 
     print("\n=== PHASE 2 AUDIT PROBE REPORT ===")
     print(rendered)
 
+    # Đường dẫn lưu file
     output_path = os.getenv(
         "AUDIT_PROBE_OUTPUT",
         r"D:\KTPMphase2\audit-base.json",
@@ -468,9 +504,16 @@ def export_audit_report(report: dict | list) -> None:
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    destination.write_text(rendered + "\n", encoding="utf-8")
+    # Ghi JSON
+    destination.write_text(
+        rendered + "\n",
+        encoding="utf-8",
+    )
 
-    print(f"\nJSON report written to: {destination.resolve()}")
+    print(
+        f"\nJSON report written to: {destination.resolve()}"
+    )
+
 def test_export_audit_report():
     report = {
         "requests_per_case": 1,
@@ -487,5 +530,12 @@ def test_export_audit_report():
     report["fixture_sha256"] = hashlib.sha256(
     _valid_png_bytes()
     ).hexdigest()
+
+    export_audit_report(report)
+    
+def test_export_audit_report_metadata():
+    report = {
+        "test": "metadata_export_check",
+    }
 
     export_audit_report(report)
