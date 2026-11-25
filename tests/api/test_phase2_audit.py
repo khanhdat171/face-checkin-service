@@ -1,22 +1,21 @@
 from __future__ import annotations
 
 import hashlib
-import subprocess
 import json
 import os
-from pathlib import Path
 import struct
+import subprocess
 import zlib
-from datetime import UTC, datetime, timedelta
-from typing import Annotated
 from collections import Counter
-from sqlalchemy import event
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Annotated
 
 import numpy as np
 import pytest
 from fastapi import Depends
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
@@ -29,7 +28,6 @@ from app.core.config import get_settings
 from app.core.security import create_access_token
 from app.domain import FaceEmbedder, InvalidImage, NoFaceDetected, Role, UnmatchedFace
 from app.models import Base, CheckInRecordORM, FaceProfileORM, UserORM
-
 
 JWT_SECRET = "phase2-audit-test-secret-do-not-use-in-production"
 FAKE_MODEL_NAME = "phase2-fake-model"
@@ -77,11 +75,7 @@ def _reset_database_dependencies() -> None:
 def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     chunk_body = chunk_type + data
     checksum = zlib.crc32(chunk_body) & 0xFFFFFFFF
-    return (
-        len(data).to_bytes(4, "big")
-        + chunk_body
-        + checksum.to_bytes(4, "big")
-    )
+    return len(data).to_bytes(4, "big") + chunk_body + checksum.to_bytes(4, "big")
 
 
 def _valid_png_bytes() -> bytes:
@@ -102,7 +96,6 @@ def _valid_png_bytes() -> bytes:
 
 
 @pytest.fixture
-
 def audit_app(tmp_path, monkeypatch):
     """Tạo FastAPI app + database SQLite tạm cho từng test."""
     database_file = tmp_path / "phase2-audit.sqlite3"
@@ -192,9 +185,7 @@ def _post_face_registration(client: TestClient, token: str):
 def _audit_rows() -> list[dict[str, int | str | None]]:
     """Đọc audit bằng Session MỚI, độc lập với Session xử lý HTTP request."""
     with get_session_factory()() as session:
-        rows = session.scalars(
-            select(CheckInRecordORM).order_by(CheckInRecordORM.id)
-        ).all()
+        rows = session.scalars(select(CheckInRecordORM).order_by(CheckInRecordORM.id)).all()
         return [
             {
                 "id": row.id,
@@ -204,14 +195,13 @@ def _audit_rows() -> list[dict[str, int | str | None]]:
             }
             for row in rows
         ]
-        
+
+
 def _count_rows(model: type) -> int:
     with get_session_factory()() as session:
-        count = session.scalar(
-            select(func.count()).select_from(model)
-        )
+        count = session.scalar(select(func.count()).select_from(model))
         return int(count or 0)
-    
+
 
 def _user_exists(email: str) -> bool:
     with get_session_factory()() as session:
@@ -283,7 +273,8 @@ def test_success_returns_201_and_commits_one_audit_record(audit_app):
     assert rows[0]["status"] == "success"
     assert rows[0]["user_id"] == user_id
     assert rows[0]["matched_face_profile_id"] == profile_id
-    
+
+
 def test_register_face_without_face_returns_422_and_creates_no_audit(audit_app):
     """Đăng ký profile không phát hiện mặt: không được tạo check-in audit."""
     audit_app.dependency_overrides[get_embedder] = lambda: FakeEmbedder(
@@ -300,7 +291,8 @@ def test_register_face_without_face_returns_422_and_creates_no_audit(audit_app):
     assert "record_id" not in response.json()
     assert _count_rows(CheckInRecordORM) == 0
     assert _count_rows(FaceProfileORM) == 0
-    
+
+
 def test_other_domain_error_after_flush_rolls_back(audit_app):
     """DomainError khác sau flush phải rollback thay vì commit dữ liệu dở."""
     email = "must-rollback-domain@example.com"
@@ -322,16 +314,15 @@ def test_other_domain_error_after_flush_rolls_back(audit_app):
         raise InvalidImage("injected domain error after flush")
 
     with TestClient(audit_app) as client:
-        response = client.post(
-            "/_test/domain-error-after-flush"
-            )
+        response = client.post("/_test/domain-error-after-flush")
 
     # InvalidImage được map thành HTTP 400 bởi app/api/errors.py.
     assert response.status_code == 400
     assert response.json()["error"] == "InvalidImage"
     assert not _user_exists(email)
     assert _count_rows(CheckInRecordORM) == 0
-    
+
+
 @pytest.mark.parametrize(
     ("kind", "expected_status"),
     [("no-face", 422), ("unmatched", 404)],
@@ -370,7 +361,8 @@ def test_audit_error_without_record_id_rolls_back_flushed_data(
     assert response.status_code == expected_status
     assert not _user_exists(email)
     assert _count_rows(CheckInRecordORM) == 0
-    
+
+
 def test_unexpected_system_error_after_flush_rolls_back(audit_app):
     """RuntimeError sau flush phải rollback; HTTP mặc định là 500."""
     email = "must-rollback-system@example.com"
@@ -397,19 +389,20 @@ def test_unexpected_system_error_after_flush_rolls_back(audit_app):
     assert response.status_code == 500
     assert not _user_exists(email)
     assert _count_rows(CheckInRecordORM) == 0
-    
+
+
 def test_commit_failure_rolls_back_and_closes_session(audit_app, monkeypatch):
     """Commit thất bại phải gọi rollback, đóng Session và không lưu dữ liệu."""
     email = "must-rollback-commit-failure@example.com"
 
     @audit_app.post("/_test/commit-failure")
     def create_then_commit(
-    session: Annotated[
-        Session,
-        Depends(get_session, scope="function"),
+        session: Annotated[
+            Session,
+            Depends(get_session, scope="function"),
         ],
     ) -> dict[str, bool]:
-        
+
         session.add(
             UserORM(
                 email=email,
@@ -455,14 +448,11 @@ def test_commit_failure_rolls_back_and_closes_session(audit_app, monkeypatch):
     # Query bằng một Session mới sau khi request và cleanup đã kết thúc.
     assert not _user_exists(email)
     assert _count_rows(CheckInRecordORM) == 0
-    
+
 
 def export_audit_report(report: dict | list) -> None:
     # Chuyển report thành dictionary để bổ sung metadata
-    if isinstance(report, dict):
-        report_data = dict(report)
-    else:
-        report_data = {"results": report}
+    report_data = dict(report) if isinstance(report, dict) else {"results": report}
 
     # Xác định thư mục gốc repository
     repo_root = Path(__file__).resolve().parents[2]
@@ -479,9 +469,7 @@ def export_audit_report(report: dict | list) -> None:
     git_head = result.stdout.strip()
 
     # Tính SHA256 của ảnh PNG fixture
-    fixture_sha256 = hashlib.sha256(
-        _valid_png_bytes()
-    ).hexdigest()
+    fixture_sha256 = hashlib.sha256(_valid_png_bytes()).hexdigest()
 
     # Bổ sung metadata trực tiếp vào JSON
     report_data["git_head"] = git_head
@@ -512,9 +500,8 @@ def export_audit_report(report: dict | list) -> None:
         encoding="utf-8",
     )
 
-    print(
-        f"\nJSON report written to: {destination.resolve()}"
-    )
+    print(f"\nJSON report written to: {destination.resolve()}")
+
 
 # ===== Append the helpers and benchmark test below export_audit_report() =====
 
@@ -523,9 +510,7 @@ def _count_users_with_prefix(prefix: str) -> int:
     """Count only synthetic users created by one probe case."""
     with get_session_factory()() as session:
         value = session.scalar(
-            select(func.count())
-            .select_from(UserORM)
-            .where(UserORM.email.like(f"{prefix}%"))
+            select(func.count()).select_from(UserORM).where(UserORM.email.like(f"{prefix}%"))
         )
         return int(value or 0)
 
@@ -558,6 +543,7 @@ def _request_with_session_counters(
     original_flush = Session.flush
 
     with monkeypatch.context() as patch:
+
         def tracked_commit(self, *args, **kwargs):
             counters["commit"] += 1
             if fail_commit:
@@ -684,9 +670,7 @@ def _run_ten_request_case(
     update_count = {"audit": 0}
     table_name = CheckInRecordORM.__tablename__.lower()
 
-    def count_audit_updates(
-        conn, cursor, statement, parameters, context, executemany
-    ):
+    def count_audit_updates(conn, cursor, statement, parameters, context, executemany):
         normalized = statement.lstrip().lower()
         if normalized.startswith("update") and table_name in normalized:
             update_count["audit"] += 1
@@ -697,12 +681,8 @@ def _run_ten_request_case(
     try:
         for index in range(10):
             audit_before = len(_audit_rows())
-            dirty_before = (
-                _count_users_with_prefix(dirty_email_prefix)
-                if dirty_email_prefix
-                else 0
-            )
-            
+            dirty_before = _count_users_with_prefix(dirty_email_prefix) if dirty_email_prefix else 0
+
             response, lifecycle = _request_with_session_counters(
                 monkeypatch,
                 send_request,
@@ -733,11 +713,7 @@ def _run_ten_request_case(
             audit_delta = audit_after - audit_before
             audit_delta_total += audit_delta
 
-            dirty_after = (
-                _count_users_with_prefix(dirty_email_prefix)
-                if dirty_email_prefix
-                else 0
-            )
+            dirty_after = _count_users_with_prefix(dirty_email_prefix) if dirty_email_prefix else 0
             dirty_delta = dirty_after - dirty_before
             dirty_user_delta_total += dirty_delta
 
@@ -799,9 +775,7 @@ def _run_ten_request_case(
 def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
     """Benchmark Base/Fix with 10 independent requests for every scenario."""
     # Prepare one account for registration and one matched profile for success.
-    registration_user_id = _create_user(
-        email="phase2-registration-user@example.com"
-    )
+    registration_user_id = _create_user(email="phase2-registration-user@example.com")
     registration_token = _create_user_token(registration_user_id)
 
     success_user_id = _create_user(email="phase2-success-user@example.com")
@@ -827,8 +801,8 @@ def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
             email_prefix=prefix,
             error_kind=error_kind,
         )
-        
-        flush_prefix = "phase2-probe-flush-failure-"
+
+    flush_prefix = "phase2-probe-flush-failure-"
     route_paths["flush_failure"] = "/_phase2/flush-failure"
     dirty_prefixes["flush_failure"] = flush_prefix
     _register_dirty_flush_route(
@@ -864,7 +838,7 @@ def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
         results["face_profile_registration_no_face"]["face_profile_delta_total"] = (
             _count_rows(FaceProfileORM) - profile_before
         )
-        
+
         # 2. NoFace with a real audit record_id: each request must add one row.
         audit_app.dependency_overrides[get_embedder] = lambda: FakeEmbedder(
             error=NoFaceDetected("phase2 benchmark: no face")
@@ -876,11 +850,9 @@ def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
             send_request=lambda: _post_checkin(client),
             expected_status=422,
         )
-        
+
         # 3. Unmatched with a real audit record_id. Vector is orthogonal to profile.
-        audit_app.dependency_overrides[get_embedder] = lambda: _make_embedder_result(
-            [0.0, 1.0]
-        )
+        audit_app.dependency_overrides[get_embedder] = lambda: _make_embedder_result([0.0, 1.0])
         results["unmatched_with_record_id"] = _run_ten_request_case(
             name="unmatched_with_record_id",
             client=client,
@@ -888,11 +860,9 @@ def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
             send_request=lambda: _post_checkin(client),
             expected_status=404,
         )
-        
+
         # 4. Successful check-in: each independent request creates one audit.
-        audit_app.dependency_overrides[get_embedder] = lambda: _make_embedder_result(
-            [1.0, 0.0]
-        )
+        audit_app.dependency_overrides[get_embedder] = lambda: _make_embedder_result([1.0, 0.0])
         results["success"] = _run_ten_request_case(
             name="success",
             client=client,
@@ -900,7 +870,7 @@ def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
             send_request=lambda: _post_checkin(client),
             expected_status=201,
         )
-        
+
         # 5-10. Dirty-write/error cases. Each is followed by a successful check-in.
         rollback_cases = [
             (
@@ -942,9 +912,7 @@ def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
         ]
 
         for case_name, expected_status, fail_flush, fail_commit in rollback_cases:
-            audit_app.dependency_overrides[get_embedder] = lambda: _make_embedder_result(
-                [1.0, 0.0]
-            )
+            audit_app.dependency_overrides[get_embedder] = lambda: _make_embedder_result([1.0, 0.0])
             results[case_name] = _run_ten_request_case(
                 name=case_name,
                 client=client,
@@ -957,20 +925,17 @@ def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
                 follow_up_checkin=True,
             )
 
+    # Tổng hợp đầy đủ kết quả benchmark
     report = {
         "benchmark": "phase2_audit_transaction_probe",
         "requests_per_case": 10,
         "primary_case_count": len(results),
         "primary_request_count": 10 * len(results),
         "followup_request_count": sum(
-            sum(item["followup_http_counts"].values())
-            for item in results.values()
+            sum(item["followup_http_counts"].values()) for item in results.values()
         ),
         "total_http_request_count": 10 * len(results)
-        + sum(
-            sum(item["followup_http_counts"].values())
-            for item in results.values()
-        ),
+        + sum(sum(item["followup_http_counts"].values()) for item in results.values()),
         "database": "SQLite temporary database",
         "git_head": subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
@@ -981,15 +946,26 @@ def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
         "results": results,
     }
 
-    # export_audit_report also adds git_head and fixture_sha256, then writes JSON.
+    # Xuất JSON trước khi kiểm tra assertion
+    # Nhờ vậy vẫn giữ được số liệu nếu một assertion thất bại.
     export_audit_report(report)
 
-    # Assertions common to Base and Fix. Do not assert dirty rows == 0 here:
-    # the Base run is intentionally expected to reveal the old transaction bug.
+    # 1. Kiểm tra mỗi trường hợp có đúng 10 request.
     for case_name, result in results.items():
         assert sum(result["http_counts"].values()) == 10, case_name
-        assert result["session_closed_count"] == 10, case_name
 
+        assert len(result["requests"]) == 10, case_name
+
+        # Một request có thể gọi Session.close() nhiều lần.
+        assert result["session_closed_count"] >= 10, case_name
+
+        # Xác nhận từng request có ít nhất một lần close.
+        for request in result["requests"]:
+            assert request["close_calls"] >= 1, (
+                f"{case_name}, request {request['request']}: Session was not closed"
+            )
+
+    # 2. Các trường hợp audit hợp lệ phải tăng đủ 10 bản ghi.
     for case_name in (
         "no_face_with_record_id",
         "unmatched_with_record_id",
@@ -999,15 +975,32 @@ def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
         assert results[case_name]["unique_record_ids"] == 10, case_name
         assert results[case_name]["overwrite_count"] == 0, case_name
 
-    # Registration without face must not create check-in audit.
-    assert (
-        results["face_profile_registration_no_face"][
-            "face_profile_delta_total"
-        ] == 0
-    )
-    assert (
-        results["face_profile_registration_no_face"][
-            "audit_delta_total"
-        ] == 0
-    )
-        
+    # 3. Đăng ký khuôn mặt không có mặt không tạo audit/profile.
+    registration = results["face_profile_registration_no_face"]
+
+    assert registration["face_profile_delta_total"] == 0
+    assert registration["audit_delta_total"] == 0
+
+    # 4. Kiểm tra nghiêm ngặt trên phiên bản Fix.
+    strict_mode = os.getenv("AUDIT_PROBE_STRICT", "0") == "1"
+
+    if strict_mode:
+        rollback_cases = (
+            "no_face_without_record_id",
+            "unmatched_without_record_id",
+            "other_domain_error_after_flush",
+            "system_error_after_flush",
+            "flush_failure",
+            "commit_failure",
+        )
+
+        for case_name in rollback_cases:
+            result = results[case_name]
+
+            assert result["dirty_user_delta_total"] == 0, case_name
+
+            assert result["rollback_call_count"] >= 10, case_name
+
+            assert result["session_closed_count"] >= 10, case_name
+
+    print("\nPHASE 2 AUDIT BENCHMARK COMPLETED")
