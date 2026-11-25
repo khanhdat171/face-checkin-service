@@ -20,7 +20,13 @@ from app.repositories import (
     SQLAlchemyUserRepository,
 )
 from app.services import CheckInService, FaceProfileService, UserService
-
+from app.domain.errors import (
+    DomainError,
+    InvalidToken,
+    NoFaceDetected,
+    PermissionDenied,
+    UnmatchedFace,
+)
 
 @lru_cache
 def get_engine() -> Engine:
@@ -38,19 +44,39 @@ def get_session_factory() -> sessionmaker[Session]:
 
 def get_session() -> Iterator[Session]:
     session = get_session_factory()()
+
     try:
         yield session
-    except DomainError:
-        # Vẫn commit khi có lỗi nghiệp vụ để giữ lịch sử check-in thất bại.
-        session.commit()
+
+    except (NoFaceDetected, UnmatchedFace) as exc:
+        # Chỉ bắt hai lỗi đặc biệt.
+        if exc.record_id is not None:
+            try:
+                session.commit()   # Chỉ commit khi đã có ID audit.
+            except BaseException:
+                session.rollback()  # Nếu không có ID: Không được commit dữ liệu ghi dở.
+                raise
+        else:
+            session.rollback()
         raise
-    except BaseException:
+
+    except DomainError:
         session.rollback()
         raise
+
+    except BaseException:
+        session.rollback()  # Khi gặp lỗi ngoài dự kiến, rollback và phát sinh lại lỗi. 
+        raise  #Điều này đảm bảo nếu commit/flush bị lỗi thì transaction được rollback, lỗi được phát sinh lại và session vẫn được đóng
+
     else:
-        session.commit()
+        try:
+            session.commit()  # Khi request kết thúc bình thường thì commit.
+        except BaseException:
+            session.rollback()
+            raise
+
     finally:
-        session.close()
+        session.close()   # Dù request thành công hay thất bại thì session đều phải được đóng.
 
 
 @lru_cache
