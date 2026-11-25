@@ -10,3 +10,4 @@
 - Kết quả Test / Benchmark: Pass thành công 153 test và 10 Benchmark.
 - File giải thích vấn đáp: docs/explain_22025521.md
 - Lưu ý / Phát sinh (nếu có): push code vào 1 file fork riêng
+                              file Báo cáo KTPM phase2-1.docx là file draf (lưu lại ảnh cần thiết trong quá trình làm bài)
