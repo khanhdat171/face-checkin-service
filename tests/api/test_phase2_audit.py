@@ -9,6 +9,8 @@ import struct
 import zlib
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
+from collections import Counter
+from sqlalchemy import event
 
 import numpy as np
 import pytest
@@ -514,28 +516,498 @@ def export_audit_report(report: dict | list) -> None:
         f"\nJSON report written to: {destination.resolve()}"
     )
 
-def test_export_audit_report():
-    report = {
-        "requests_per_case": 1,
-        "test_status": "PASS",
-        "test_file": "tests/api/test_phase2_audit.py",
-        "note": "Smoke test for JSON export only",
+# ===== Append the helpers and benchmark test below export_audit_report() =====
+
+
+def _count_users_with_prefix(prefix: str) -> int:
+    """Count only synthetic users created by one probe case."""
+    with get_session_factory()() as session:
+        value = session.scalar(
+            select(func.count())
+            .select_from(UserORM)
+            .where(UserORM.email.like(f"{prefix}%"))
+        )
+        return int(value or 0)
+
+
+def _create_probe_user(session: Session, email: str) -> None:
+    session.add(
+        UserORM(
+            email=email,
+            hashed_password="phase2-probe-hash",
+            role="user",
+            full_name="Phase 2 Probe User",
+            created_at=datetime.now(UTC),
+        )
+    )
+
+
+def _request_with_session_counters(
+    monkeypatch,
+    send_request,
+    *,
+    fail_flush: bool = False,
+    fail_commit: bool = False,
+) -> tuple[object, dict[str, int]]:
+    """Run exactly one HTTP request while counting Session lifecycle calls."""
+    counters = {"commit": 0, "rollback": 0, "close": 0, "flush": 0}
+
+    original_commit = Session.commit
+    original_rollback = Session.rollback
+    original_close = Session.close
+    original_flush = Session.flush
+
+    with monkeypatch.context() as patch:
+        def tracked_commit(self, *args, **kwargs):
+            counters["commit"] += 1
+            if fail_commit:
+                raise RuntimeError("phase2 probe: injected commit failure")
+            return original_commit(self, *args, **kwargs)
+
+        def tracked_rollback(self, *args, **kwargs):
+            counters["rollback"] += 1
+            return original_rollback(self, *args, **kwargs)
+
+        def tracked_close(self, *args, **kwargs):
+            counters["close"] += 1
+            return original_close(self, *args, **kwargs)
+
+        def tracked_flush(self, *args, **kwargs):
+            counters["flush"] += 1
+            if fail_flush:
+                raise RuntimeError("phase2 probe: injected flush failure")
+            return original_flush(self, *args, **kwargs)
+
+        patch.setattr(Session, "commit", tracked_commit)
+        patch.setattr(Session, "rollback", tracked_rollback)
+        patch.setattr(Session, "close", tracked_close)
+        patch.setattr(Session, "flush", tracked_flush)
+
+        response = send_request()
+
+    return response, counters
+
+
+def _register_dirty_error_route(
+    app,
+    *,
+    path: str,
+    email_prefix: str,
+    error_kind: str,
+) -> None:
+    """Register a test-only endpoint that flushes a user and then raises."""
+    state = {"index": 0}
+
+    @app.post(path)
+    def dirty_error_endpoint(
+        session: Annotated[Session, Depends(get_session)],
+    ) -> None:
+        email = f"{email_prefix}{state['index']}@example.com"
+        state["index"] += 1
+        _create_probe_user(session, email)
+        session.flush()
+
+        if error_kind == "no_face":
+            raise NoFaceDetected("phase2 probe: NoFace without record_id")
+        if error_kind == "unmatched":
+            raise UnmatchedFace(0.2)
+        if error_kind == "domain":
+            raise InvalidImage("phase2 probe: InvalidImage after flush")
+        if error_kind == "system":
+            raise RuntimeError("phase2 probe: RuntimeError after flush")
+        raise AssertionError(f"Unknown probe error kind: {error_kind}")
+
+
+def _register_dirty_flush_route(app, *, path: str, email_prefix: str) -> None:
+    """Endpoint whose explicit flush is replaced by an injected failure."""
+    state = {"index": 0}
+
+    @app.post(path)
+    def flush_failure_endpoint(
+        session: Annotated[Session, Depends(get_session)],
+    ) -> None:
+        email = f"{email_prefix}{state['index']}@example.com"
+        state["index"] += 1
+        _create_probe_user(session, email)
+        session.flush()
+        return None
+
+
+def _register_dirty_commit_route(app, *, path: str, email_prefix: str) -> None:
+    """Use function-scoped dependency so commit failure occurs before response."""
+    state = {"index": 0}
+
+    @app.post(path)
+    def commit_failure_endpoint(
+        session: Annotated[
+            Session,
+            Depends(get_session, scope="function"),
+        ],
+    ) -> dict[str, bool]:
+        email = f"{email_prefix}{state['index']}@example.com"
+        state["index"] += 1
+        _create_probe_user(session, email)
+        session.flush()
+        return {"ok": True}
+
+
+def _count_http_statuses(statuses: list[int]) -> dict[str, int]:
+    return dict(sorted(Counter(str(status) for status in statuses).items()))
+
+
+def _run_ten_request_case(
+    *,
+    name: str,
+    client: TestClient,
+    monkeypatch,
+    send_request,
+    expected_status: int,
+    dirty_email_prefix: str | None = None,
+    fail_flush: bool = False,
+    fail_commit: bool = False,
+    follow_up_checkin: bool = False,
+) -> dict:
+    """Run 10 sequential, independent HTTP requests and measure each delta."""
+    statuses: list[int] = []
+    record_ids: list[int] = []
+    request_details: list[dict] = []
+    follow_up_statuses: list[int] = []
+
+    audit_delta_total = 0
+    dirty_user_delta_total = 0
+    rollback_call_count = 0
+    session_closed_count = 0
+    commit_call_count = 0
+    flush_call_count = 0
+
+    engine = get_engine()
+    update_count = {"audit": 0}
+    table_name = CheckInRecordORM.__tablename__.lower()
+
+    def count_audit_updates(
+        conn, cursor, statement, parameters, context, executemany
+    ):
+        normalized = statement.lstrip().lower()
+        if normalized.startswith("update") and table_name in normalized:
+            update_count["audit"] += 1
+
+    event.listen(engine, "before_cursor_execute", count_audit_updates)
+    update_count_before = update_count["audit"]
+
+    try:
+        for index in range(10):
+            audit_before = len(_audit_rows())
+            dirty_before = (
+                _count_users_with_prefix(dirty_email_prefix)
+                if dirty_email_prefix
+                else 0
+            )
+            
+            response, lifecycle = _request_with_session_counters(
+                monkeypatch,
+                send_request,
+                fail_flush=fail_flush,
+                fail_commit=fail_commit,
+            )
+
+            status = int(response.status_code)
+            statuses.append(status)
+            if status != expected_status:
+                raise AssertionError(
+                    f"{name} request {index + 1}: expected HTTP "
+                    f"{expected_status}, received {status}; body={response.text}"
+                )
+
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+
+            record_id = body.get("record_id")
+            if record_id is None and body.get("status") == "success":
+                record_id = body.get("id")
+            if isinstance(record_id, int):
+                record_ids.append(record_id)
+
+            audit_after = len(_audit_rows())
+            audit_delta = audit_after - audit_before
+            audit_delta_total += audit_delta
+
+            dirty_after = (
+                _count_users_with_prefix(dirty_email_prefix)
+                if dirty_email_prefix
+                else 0
+            )
+            dirty_delta = dirty_after - dirty_before
+            dirty_user_delta_total += dirty_delta
+
+            rollback_call_count += lifecycle["rollback"]
+            session_closed_count += lifecycle["close"]
+            commit_call_count += lifecycle["commit"]
+            flush_call_count += lifecycle["flush"]
+
+            request_details.append(
+                {
+                    "request": index + 1,
+                    "http_status": status,
+                    "record_id": record_id,
+                    "audit_before": audit_before,
+                    "audit_after": audit_after,
+                    "audit_delta": audit_delta,
+                    "dirty_users_before": dirty_before,
+                    "dirty_users_after": dirty_after,
+                    "dirty_user_delta": dirty_delta,
+                    "rollback_calls": lifecycle["rollback"],
+                    "close_calls": lifecycle["close"],
+                    "commit_calls": lifecycle["commit"],
+                    "flush_calls": lifecycle["flush"],
+                }
+            )
+
+            if follow_up_checkin:
+                # The error endpoint must not poison the next independent request.
+                response_follow_up = _post_checkin(client)
+                follow_up_statuses.append(int(response_follow_up.status_code))
+                if response_follow_up.status_code != 201:
+                    raise AssertionError(
+                        f"{name} follow-up after request {index + 1}: "
+                        f"expected HTTP 201, received "
+                        f"{response_follow_up.status_code}; "
+                        f"body={response_follow_up.text}"
+                    )
+    finally:
+        event.remove(engine, "before_cursor_execute", count_audit_updates)
+
+    unique_ids = len(set(record_ids))
+    return {
+        "http_counts": _count_http_statuses(statuses),
+        "record_ids": record_ids,
+        "unique_record_ids": unique_ids,
+        "overwrite_count": len(record_ids) - unique_ids,
+        "audit_delta_total": audit_delta_total,
+        "dirty_user_delta_total": dirty_user_delta_total,
+        "audit_update_statement_count": update_count["audit"] - update_count_before,
+        "rollback_call_count": rollback_call_count,
+        "session_closed_count": session_closed_count,
+        "commit_call_count": commit_call_count,
+        "flush_call_count": flush_call_count,
+        "followup_http_counts": _count_http_statuses(follow_up_statuses),
+        "requests": request_details,
     }
-    
-    report["git_head"] = subprocess.check_output(
-    ["git", "rev-parse", "HEAD"],
-    text=True,
-    ).strip()
 
-    report["fixture_sha256"] = hashlib.sha256(
-    _valid_png_bytes()
-    ).hexdigest()
 
-    export_audit_report(report)
-    
-def test_export_audit_report_metadata():
+def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
+    """Benchmark Base/Fix with 10 independent requests for every scenario."""
+    # Prepare one account for registration and one matched profile for success.
+    registration_user_id = _create_user(
+        email="phase2-registration-user@example.com"
+    )
+    registration_token = _create_user_token(registration_user_id)
+
+    success_user_id = _create_user(email="phase2-success-user@example.com")
+    _create_face_profile(success_user_id, np.asarray([1.0, 0.0], dtype=np.float32))
+
+    # Test-only endpoints. They are registered only on this in-memory test app.
+    route_specs = [
+        ("no_face_without_record_id", "/_phase2/no-face-without-id", "no_face"),
+        ("unmatched_without_record_id", "/_phase2/unmatched-without-id", "unmatched"),
+        ("other_domain_error_after_flush", "/_phase2/domain-error-after-flush", "domain"),
+        ("system_error_after_flush", "/_phase2/system-error-after-flush", "system"),
+    ]
+    dirty_prefixes: dict[str, str] = {}
+    route_paths: dict[str, str] = {}
+
+    for case_name, route_path, error_kind in route_specs:
+        prefix = f"phase2-probe-{case_name}-"
+        dirty_prefixes[case_name] = prefix
+        route_paths[case_name] = route_path
+        _register_dirty_error_route(
+            audit_app,
+            path=route_path,
+            email_prefix=prefix,
+            error_kind=error_kind,
+        )
+        
+        flush_prefix = "phase2-probe-flush-failure-"
+    route_paths["flush_failure"] = "/_phase2/flush-failure"
+    dirty_prefixes["flush_failure"] = flush_prefix
+    _register_dirty_flush_route(
+        audit_app,
+        path=route_paths["flush_failure"],
+        email_prefix=flush_prefix,
+    )
+
+    commit_prefix = "phase2-probe-commit-failure-"
+    route_paths["commit_failure"] = "/_phase2/commit-failure"
+    dirty_prefixes["commit_failure"] = commit_prefix
+    _register_dirty_commit_route(
+        audit_app,
+        path=route_paths["commit_failure"],
+        email_prefix=commit_prefix,
+    )
+
+    results: dict[str, dict] = {}
+
+    with TestClient(audit_app, raise_server_exceptions=False) as client:
+        # 1. Face registration without a face: 422, no check-in audit/profile.
+        audit_app.dependency_overrides[get_embedder] = lambda: FakeEmbedder(
+            error=NoFaceDetected("phase2 benchmark: no face during registration")
+        )
+        profile_before = _count_rows(FaceProfileORM)
+        results["face_profile_registration_no_face"] = _run_ten_request_case(
+            name="face_profile_registration_no_face",
+            client=client,
+            monkeypatch=monkeypatch,
+            send_request=lambda: _post_face_registration(client, registration_token),
+            expected_status=422,
+        )
+        results["face_profile_registration_no_face"]["face_profile_delta_total"] = (
+            _count_rows(FaceProfileORM) - profile_before
+        )
+        
+        # 2. NoFace with a real audit record_id: each request must add one row.
+        audit_app.dependency_overrides[get_embedder] = lambda: FakeEmbedder(
+            error=NoFaceDetected("phase2 benchmark: no face")
+        )
+        results["no_face_with_record_id"] = _run_ten_request_case(
+            name="no_face_with_record_id",
+            client=client,
+            monkeypatch=monkeypatch,
+            send_request=lambda: _post_checkin(client),
+            expected_status=422,
+        )
+        
+        # 3. Unmatched with a real audit record_id. Vector is orthogonal to profile.
+        audit_app.dependency_overrides[get_embedder] = lambda: _make_embedder_result(
+            [0.0, 1.0]
+        )
+        results["unmatched_with_record_id"] = _run_ten_request_case(
+            name="unmatched_with_record_id",
+            client=client,
+            monkeypatch=monkeypatch,
+            send_request=lambda: _post_checkin(client),
+            expected_status=404,
+        )
+        
+        # 4. Successful check-in: each independent request creates one audit.
+        audit_app.dependency_overrides[get_embedder] = lambda: _make_embedder_result(
+            [1.0, 0.0]
+        )
+        results["success"] = _run_ten_request_case(
+            name="success",
+            client=client,
+            monkeypatch=monkeypatch,
+            send_request=lambda: _post_checkin(client),
+            expected_status=201,
+        )
+        
+        # 5-10. Dirty-write/error cases. Each is followed by a successful check-in.
+        rollback_cases = [
+            (
+                "no_face_without_record_id",
+                422,
+                False,
+                False,
+            ),
+            (
+                "unmatched_without_record_id",
+                404,
+                False,
+                False,
+            ),
+            (
+                "other_domain_error_after_flush",
+                400,
+                False,
+                False,
+            ),
+            (
+                "system_error_after_flush",
+                500,
+                False,
+                False,
+            ),
+            (
+                "flush_failure",
+                500,
+                True,
+                False,
+            ),
+            (
+                "commit_failure",
+                500,
+                False,
+                True,
+            ),
+        ]
+
+        for case_name, expected_status, fail_flush, fail_commit in rollback_cases:
+            audit_app.dependency_overrides[get_embedder] = lambda: _make_embedder_result(
+                [1.0, 0.0]
+            )
+            results[case_name] = _run_ten_request_case(
+                name=case_name,
+                client=client,
+                monkeypatch=monkeypatch,
+                send_request=lambda path=route_paths[case_name]: client.post(path),
+                expected_status=expected_status,
+                dirty_email_prefix=dirty_prefixes[case_name],
+                fail_flush=fail_flush,
+                fail_commit=fail_commit,
+                follow_up_checkin=True,
+            )
+
     report = {
-        "test": "metadata_export_check",
+        "benchmark": "phase2_audit_transaction_probe",
+        "requests_per_case": 10,
+        "primary_case_count": len(results),
+        "primary_request_count": 10 * len(results),
+        "followup_request_count": sum(
+            sum(item["followup_http_counts"].values())
+            for item in results.values()
+        ),
+        "total_http_request_count": 10 * len(results)
+        + sum(
+            sum(item["followup_http_counts"].values())
+            for item in results.values()
+        ),
+        "database": "SQLite temporary database",
+        "git_head": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            text=True,
+        ).strip(),
+        "fixture_sha256": hashlib.sha256(_valid_png_bytes()).hexdigest(),
+        "results": results,
     }
 
+    # export_audit_report also adds git_head and fixture_sha256, then writes JSON.
     export_audit_report(report)
+
+    # Assertions common to Base and Fix. Do not assert dirty rows == 0 here:
+    # the Base run is intentionally expected to reveal the old transaction bug.
+    for case_name, result in results.items():
+        assert sum(result["http_counts"].values()) == 10, case_name
+        assert result["session_closed_count"] == 10, case_name
+
+    for case_name in (
+        "no_face_with_record_id",
+        "unmatched_with_record_id",
+        "success",
+    ):
+        assert results[case_name]["audit_delta_total"] == 10, case_name
+        assert results[case_name]["unique_record_ids"] == 10, case_name
+        assert results[case_name]["overwrite_count"] == 0, case_name
+
+    # Registration without face must not create check-in audit.
+    assert (
+        results["face_profile_registration_no_face"][
+            "face_profile_delta_total"
+        ] == 0
+    )
+    assert (
+        results["face_profile_registration_no_face"][
+            "audit_delta_total"
+        ] == 0
+    )
+        
