@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import subprocess
 import json
 import os
 from pathlib import Path
@@ -476,5 +478,14 @@ def test_export_audit_report():
         "test_file": "tests/api/test_phase2_audit.py",
         "note": "Smoke test for JSON export only",
     }
+    
+    report["git_head"] = subprocess.check_output(
+    ["git", "rev-parse", "HEAD"],
+    text=True,
+    ).strip()
+
+    report["fixture_sha256"] = hashlib.sha256(
+    _valid_png_bytes()
+    ).hexdigest()
 
     export_audit_report(report)
