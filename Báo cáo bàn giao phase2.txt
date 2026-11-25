@@ -1,0 +1,12 @@
+=== BÁO CÁO BÀN GIAO PHASE 2 ===
+- Thành viên: Vũ Khánh Đạt - 22025521
+- Tên nhánh: fix/22025521-audit-rollback
+- Danh sách commit đã tạo: [liệt kê hash + commit message]
+- Tóm tắt thay đổi chính: Sửa đổi code file deps.py và test_composition.py, tạo file test_phase2_audit.py và explain_22025521.md để ôn tập những gì đã làm
+- Danh sách file đã sửa/tạo mới: face-checking-service\app\api\deps.py
+                                 face-checking-service\tests\api\test_composition.py.
+                                 face-checking-service\tests\api\test_phase2_audit.py
+                                 face-checking-service\docs\explain_22025521.md
+- Kết quả Test / Benchmark: Pass thành công 153 test và 10 Benchmark.
+- File giải thích vấn đáp: docs/explain_22025521.md
+- Lưu ý / Phát sinh (nếu có): push code vào 1 file fork riêng
