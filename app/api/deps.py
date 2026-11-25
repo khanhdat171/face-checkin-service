@@ -11,7 +11,13 @@ from app.api.authentication import AuthenticatedUser
 from app.core.config import get_settings
 from app.core.security import Argon2PasswordHasher
 from app.domain.entities import Role, User
-from app.domain.errors import DomainError, InvalidToken, PermissionDenied
+from app.domain.errors import (
+    DomainError,
+    InvalidToken,
+    NoFaceDetected,
+    PermissionDenied,
+    UnmatchedFace,
+)
 from app.domain.ports import FaceEmbedder, PasswordHasher
 from app.ml import InsightFaceEmbedder
 from app.repositories import (
@@ -20,13 +26,7 @@ from app.repositories import (
     SQLAlchemyUserRepository,
 )
 from app.services import CheckInService, FaceProfileService, UserService
-from app.domain.errors import (
-    DomainError,
-    InvalidToken,
-    NoFaceDetected,
-    PermissionDenied,
-    UnmatchedFace,
-)
+
 
 @lru_cache
 def get_engine() -> Engine:
@@ -52,7 +52,7 @@ def get_session() -> Iterator[Session]:
         # Chỉ bắt hai lỗi đặc biệt.
         if exc.record_id is not None:
             try:
-                session.commit()   # Chỉ commit khi đã có ID audit.
+                session.commit()  # Chỉ commit khi đã có ID audit.
             except BaseException:
                 session.rollback()  # Nếu không có ID: Không được commit dữ liệu ghi dở.
                 raise
@@ -65,8 +65,8 @@ def get_session() -> Iterator[Session]:
         raise
 
     except BaseException:
-        session.rollback()  # Khi gặp lỗi ngoài dự kiến, rollback và phát sinh lại lỗi. 
-        raise  #Điều này đảm bảo nếu commit/flush bị lỗi thì transaction được rollback, lỗi được phát sinh lại và session vẫn được đóng
+        session.rollback()
+        raise
 
     else:
         try:
@@ -76,7 +76,7 @@ def get_session() -> Iterator[Session]:
             raise
 
     finally:
-        session.close()   # Dù request thành công hay thất bại thì session đều phải được đóng.
+        session.close()  # Dù request thành công hay thất bại thì session đều phải được đóng.
 
 
 @lru_cache

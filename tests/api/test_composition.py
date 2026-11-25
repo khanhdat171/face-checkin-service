@@ -102,6 +102,7 @@ def test_session_rolls_back_domain_error_without_audit_record(tmp_path, monkeypa
 
     assert asyncio.run(request_error()) == 422
     with get_session_factory()() as session:
-        assert session.scalar(select(UserORM.email)) is None  # sửa đoạn cuối, code cũ: == "persisted@example.com"
+        # Dữ liệu đã flush phải bị rollback.
+        assert session.scalar(select(UserORM.email)) is None
 
     _reset_database_dependencies()
