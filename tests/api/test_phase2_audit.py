@@ -173,6 +173,12 @@ def _post_checkin(client: TestClient):
         files={"image": ("face.png", _valid_png_bytes(), "image/png")},
     )
 
+def _post_invalid_checkin(client: TestClient):
+    """Gửi file ảnh rỗng để API phát sinh InvalidImage."""
+    return client.post(
+        "/api/v1/checkins",
+        files={"image": ("empty.png", b"", "image/png")},
+    )
 
 def _post_face_registration(client: TestClient, token: str):
     return client.post(
@@ -291,6 +297,36 @@ def test_register_face_without_face_returns_422_and_creates_no_audit(audit_app):
     assert "record_id" not in response.json()
     assert _count_rows(CheckInRecordORM) == 0
     assert _count_rows(FaceProfileORM) == 0
+
+
+def test_invalid_image_returns_400_without_writes_and_next_checkin_succeeds(
+    audit_app,
+):
+    """Ảnh rỗng trả 400, không tạo audit/dữ liệu mới và request sau vẫn chạy."""
+    audit_app.dependency_overrides[get_embedder] = lambda: _make_embedder_result()
+
+    user_id = _create_user(email="invalid-image-followup@example.com")
+    _create_face_profile(user_id)
+
+    audit_before = _count_rows(CheckInRecordORM)
+    user_before = _count_rows(UserORM)
+    profile_before = _count_rows(FaceProfileORM)
+
+    with TestClient(audit_app) as client:
+        invalid_response = _post_invalid_checkin(client)
+
+        assert invalid_response.status_code == 400
+        assert invalid_response.json()["error"] == "InvalidImage"
+
+        # Request ảnh lỗi không được tạo audit hoặc ghi thêm dữ liệu.
+        assert _count_rows(CheckInRecordORM) == audit_before
+        assert _count_rows(UserORM) == user_before
+        assert _count_rows(FaceProfileORM) == profile_before
+
+        # Kiểm tra Session vẫn hoạt động ở request tiếp theo.
+        followup_response = _post_checkin(client)
+
+    assert followup_response.status_code == 201
 
 
 def test_other_domain_error_after_flush_rolls_back(audit_app):
@@ -870,8 +906,24 @@ def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
             send_request=lambda: _post_checkin(client),
             expected_status=201,
         )
+        
+        
+        # 5. InvalidImage: ảnh rỗng trả 400, rollback và request tiếp theo vẫn chạy.
+        audit_app.dependency_overrides[get_embedder] = (
+            lambda: _make_embedder_result([1.0, 0.0])
+        )
 
-        # 5-10. Dirty-write/error cases. Each is followed by a successful check-in.
+        results["invalid_image"] = _run_ten_request_case(
+            name="invalid_image",
+            client=client,
+            monkeypatch=monkeypatch,
+            send_request=lambda: _post_invalid_checkin(client),
+            expected_status=400,
+            dirty_email_prefix="phase2-probe-invalid-image-",
+            follow_up_checkin=True,
+        )
+
+        # 6-11. Dirty-write/error cases. Each is followed by a successful check-in.
         rollback_cases = [
             (
                 "no_face_without_record_id",
@@ -992,6 +1044,7 @@ def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
             "system_error_after_flush",
             "flush_failure",
             "commit_failure",
+            "invalid_image",
         )
 
         for case_name in rollback_cases:
