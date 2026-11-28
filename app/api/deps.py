@@ -15,9 +15,7 @@ from app.domain.entities import Role, User
 from app.domain.errors import (
     DomainError,
     InvalidToken,
-    NoFaceDetected,
     PermissionDenied,
-    UnmatchedFace,
 )
 from app.domain.ports import FaceEmbedder, PasswordHasher
 from app.ml import InsightFaceEmbedder
