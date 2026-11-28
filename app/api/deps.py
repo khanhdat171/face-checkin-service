@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.api.authentication import AuthenticatedUser
 from app.core.config import get_settings
 from app.core.security import Argon2PasswordHasher
+from app.domain import NoFaceDetected, UnmatchedFace
 from app.domain.entities import Role, User
 from app.domain.errors import (
     DomainError,
