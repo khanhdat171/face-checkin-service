@@ -891,7 +891,6 @@ def test_phase2_audit_benchmark_report(audit_app, monkeypatch):
             expected_status=201,
         )
         
-        
         # 5. InvalidImage: ảnh rỗng trả 400, rollback và request tiếp theo vẫn chạy.
         audit_app.dependency_overrides[get_embedder] = (
             lambda: _make_embedder_result([1.0, 0.0])
