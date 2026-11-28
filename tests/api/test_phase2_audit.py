@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import struct
-import subprocess
 import zlib
 from collections import Counter
 from datetime import UTC, datetime, timedelta
